@@ -10,8 +10,9 @@
   без «Все программы» и «Ипотека в отдельных регионах».
   Тикер = <тикер региона> + название программы («Город Москва Льготная ипотека»).
 - ДДУ — строки 01_02_03 «Покупка по ДДУ, шт./млн руб.» по всем программам.
-  Ключ = <тикер региона><программа><строка> («Город МоскваВсе программы   Покупка по ДДУ, шт.»).
-  Слева служебные формулы Дани в колонках A/B.
+  Ключ = <тикер региона><программа><строка> («Город МоскваВсе программы   Покупка по ДДУ, шт.») —
+  формулой Дани =СМЕЩ(D;-A;0)&СМЕЩ(D;-B;-1)&C: A — позиция строки в блоке региона
+  (19 строк), B — 1/2 для шт./млн руб.; тикер региона стоит значением в строке региона.
 - Характеристики кредитов — все строки 01_02_05, ключ как на ДДУ.
 - Тикер региона — как у Дани (REGION_TICKERS); для остальных регионов — само название.
 
@@ -20,7 +21,9 @@
 """
 import re
 import sys
+import zipfile
 from copy import copy
+from xml.sax.saxutils import escape
 
 import openpyxl
 from openpyxl.utils import get_column_letter
@@ -42,6 +45,7 @@ EXCLUDED_PROGRAMS = {"Все программы", "Ипотека в отдел�
 DDU_RE = re.compile(r"^\s*Покупка по ДДУ,\s*(шт\.|млн руб\.)$")
 FIRST_DATA_ROW = 5
 HEADER_ROW = 4
+DDU_BLOCK = 19  # строка региона + 6 программ × (заголовок + шт. + млн руб.)
 
 
 def region_ticker(name):
@@ -157,26 +161,47 @@ def build_ddu(wb, src):
 
     regions = region_rows(src)
     prefix = program = None
+    keys = []
+    cached = {}  # результаты формул A/B/D — чтобы ключи читались и без пересчёта в Excel
+    block_start = None
+
+    def check_block():
+        # формулы Дани в A/D рассчитаны на блок ровно из DDU_BLOCK строк
+        if block_start is not None and w.row - block_start + 1 != DDU_BLOCK:
+            raise SystemExit(
+                f"ДДУ: у региона «{w.ws.cell(block_start, 3).value}» {w.row - block_start + 1} строк "
+                f"вместо {DDU_BLOCK} — в выгрузке изменился набор программ, формулы Дани не подойдут")
+
     for r in range(FIRST_DATA_ROW, src.max_row + 1):
         label = src.cell(r, 1).value
         if not isinstance(label, str):
             continue
         if r in regions:
+            check_block()
+            block_start = w.row + 1
             prefix, program, key = region_ticker(label), None, region_ticker(label)
         elif src.cell(r, 2).value is None and not label.startswith(" "):
             program, key = label, None
         elif DDU_RE.match(label):
-            key = prefix + program + label
+            key = "formula"
+            keys.append(prefix + program + label)
         else:
             continue
         w.copy_row(r)
         move(w.ws, w.row, 4, 3)
-        w.set(4, key, style_from=3 if key is None else None)
         rr = w.row
+        if key == "formula":
+            key = f"=OFFSET(D{rr},-(A{rr}),0)&OFFSET(D{rr},-(B{rr}),-1)&C{rr}"
+            cached[f"D{rr}"] = keys[-1]
+        w.set(4, key, style_from=3 if key is None else None)
         w.ws.cell(rr, 1, 0 if rr == FIRST_DATA_ROW else f"=IF(A{rr-1}=18,0,A{rr-1}+1)")
         w.ws.cell(rr, 2, f"=IF(C{rr}=$C$7,1,IF(C{rr}=$C$8,2,0))")
+        cached[f"A{rr}"] = rr - block_start
+        m = DDU_RE.match(label)
+        cached[f"B{rr}"] = {"шт.": 1, "млн руб.": 2}[m.group(1)] if m else 0
+    check_block()
     w.finish("D5", "C")
-    return w
+    return keys, cached
 
 
 def move(ws, row, from_col, to_col):
@@ -211,14 +236,46 @@ def build_characteristics(wb, src):
     return w
 
 
-def check_unique(ws, col):
+def ticker_values(ws, col):
+    return [ws.cell(r, col).value for r in range(FIRST_DATA_ROW, ws.max_row + 1)]
+
+
+def check_unique(values):
     seen, dups = set(), set()
-    for r in range(FIRST_DATA_ROW, ws.max_row + 1):
-        v = ws.cell(r, col).value
+    for v in values:
         if v in (None, ""):
             continue
         (dups if v in seen else seen).add(v)
     return len(seen), dups
+
+
+def add_cached_values(path, sheet_name, values):
+    """openpyxl пишет формулы без результата; дописываем результат в XML листа, как это делает Excel.
+    Без этого ключи пусты для ВПР из закрытой книги и для pandas, пока файл не пересохранят в Excel."""
+    with zipfile.ZipFile(path) as z:
+        items = [(info, z.read(info.filename)) for info in z.infolist()]
+    files = {info.filename: data for info, data in items}
+    wb_xml = files["xl/workbook.xml"].decode("utf-8")
+    rels = files["xl/_rels/workbook.xml.rels"].decode("utf-8")
+    rid = re.search(r'<sheet[^>]*name="%s"[^>]*r:id="([^"]+)"' % re.escape(escape(sheet_name)), wb_xml).group(1)
+    rel = next(r for r in re.findall(r"<Relationship [^>]*>", rels) if f'Id="{rid}"' in r)
+    target = re.search(r'Target="([^"]+)"', rel).group(1).lstrip("/")
+    sheet_path = target if target.startswith("xl/") else "xl/" + target
+
+    def fill(m):
+        ref, attrs, formula = m.groups()
+        if ref not in values:
+            return m.group(0)
+        v = values[ref]
+        if isinstance(v, str):
+            return f'<c r="{ref}"{attrs} t="str"><f>{formula}</f><v>{escape(v)}</v></c>'
+        return f'<c r="{ref}"{attrs}><f>{formula}</f><v>{v}</v></c>'
+
+    xml = re.sub(r'<c r="([A-Z]+\d+)"([^>]*)><f>(.*?)</f><v\s*/?>(?:</v>)?</c>', fill,
+                 files[sheet_path].decode("utf-8"))
+    with zipfile.ZipFile(path, "w", zipfile.ZIP_DEFLATED) as z:
+        for info, data in items:
+            z.writestr(info, xml.encode("utf-8") if info.filename == sheet_path else data)
 
 
 def build(raw_path, out_path):
@@ -232,7 +289,7 @@ def build(raw_path, out_path):
     print("Собираю «объем»...")
     build_count_volume(wb, wb["01_02_01"], "объем", "Всего, млн руб.")
     print("Собираю «ДДУ»...")
-    build_ddu(wb, wb["01_02_03"])
+    ddu_keys, ddu_cached = build_ddu(wb, wb["01_02_03"])
     print("Собираю «Характеристики кредитов»...")
     build_characteristics(wb, wb["01_02_05"])
     for name in raw_names:
@@ -240,13 +297,21 @@ def build(raw_path, out_path):
     wb.active = 0
 
     ok = True
-    for name, col in (("кол-во", 2), ("объем", 2), ("ДДУ", 4), ("Характеристики кредитов", 2)):
-        n, dups = check_unique(wb[name], col)
+    ddu_regions = [v for v in ticker_values(wb["ДДУ"], 4) if v and not str(v).startswith("=")]
+    tickers = {
+        "кол-во": ticker_values(wb["кол-во"], 2),
+        "объем": ticker_values(wb["объем"], 2),
+        "ДДУ": ddu_regions + ddu_keys,  # ключи ДДУ — формулы, проверяем их расчётные значения
+        "Характеристики кредитов": ticker_values(wb["Характеристики кредитов"], 2),
+    }
+    for name, values in tickers.items():
+        n, dups = check_unique(values)
         print(f"  {name}: {wb[name].max_row} строк, {n} тикеров, дублей: {len(dups)}")
         if dups:
             ok = False
             print("    дубли:", sorted(dups)[:10])
     wb.save(out_path)
+    add_cached_values(out_path, "ДДУ", ddu_cached)
     print(f"Готово: {out_path}" + ("" if ok else "  (ВНИМАНИЕ: есть дубли тикеров)"))
     return ok
 
