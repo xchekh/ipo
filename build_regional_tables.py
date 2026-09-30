@@ -3,17 +3,21 @@
 
 Вход:  «Статистические ряды_регионы.xlsx» (листы 01_02_01, 01_02_03, 01_02_05).
 Выход: новый xlsx только с готовыми листами «кол-во», «объем», «ДДУ»,
-       «Характеристики кредитов» в формате таблицы Дани, с уникальными тикерами.
+       «01_02_05» (характеристики кредитов) в формате таблицы Дани, с уникальными тикерами.
 
 Правила (как у Дани):
 - кол-во / объем — строки 01_02_01 с размерностью «Всего, шт.» / «Всего, млн руб.»,
   без «Все программы» и «Ипотека в отдельных регионах».
-  Тикер = <тикер региона> + название программы («Город Москва Льготная ипотека»).
+  Тикер = <тикер региона> + название программы («Город Москва Льготная ипотека») —
+  формулой Дани =$B$<строка региона>&A; тикер региона стоит значением в строке региона.
 - ДДУ — строки 01_02_03 «Покупка по ДДУ, шт./млн руб.» по всем программам.
   Ключ = <тикер региона><программа><строка> («Город МоскваВсе программы   Покупка по ДДУ, шт.») —
   формулой Дани =СМЕЩ(D;-A;0)&СМЕЩ(D;-B;-1)&C: A — позиция строки в блоке региона
   (19 строк), B — 1/2 для шт./млн руб.; тикер региона стоит значением в строке региона.
-- Характеристики кредитов — все строки 01_02_05, ключ как на ДДУ.
+- 01_02_05 (характеристики кредитов) — все строки выгрузки 01_02_05 в раскладке Дани:
+  B — тикер региона, C — ключ, данные с D. Ключ и числа стоят только в строке региона,
+  формулами Дани: C = B&A(+1)&A(+5) («Город МоскваВсе программы   Средний срок кредита, мес.»),
+  данные = ссылки на строку «Средний срок кредита, мес.» по всем программам.
 - Тикер региона — как у Дани (REGION_TICKERS); для остальных регионов — само название.
 
 Запуск:  python build_regional_tables.py "Статистические ряды_регионы.xlsx" [выходной.xlsx]
@@ -46,6 +50,10 @@ DDU_RE = re.compile(r"^\s*Покупка по ДДУ,\s*(шт\.|млн руб\.)
 FIRST_DATA_ROW = 5
 HEADER_ROW = 4
 DDU_BLOCK = 19  # строка региона + 6 программ × (заголовок + шт. + млн руб.)
+CHAR_SHEET = "01_02_05"  # имя готового листа характеристик — как у Дани
+CHAR_TMP_TITLE = "Характеристики кредитов"  # временное имя, пока сырой 01_02_05 ещё в книге
+CHAR_KEY_PROGRAM = "Все программы"
+CHAR_KEY_ROW = "Средний срок кредита, мес."
 
 
 def region_ticker(name):
@@ -117,7 +125,9 @@ def build_count_volume(wb, src, title, dim_label):
         w.ws.cell(3, c, c)
 
     regions = region_rows(src)
-    prefix = None
+    prefix = reg_row = None
+    tickers = []
+    cached = {}  # результаты формул — чтобы тикеры читались и без пересчёта в Excel
     for r in range(FIRST_DATA_ROW, src.max_row + 1):
         label = src.cell(r, 1).value
         if r in regions:
@@ -125,6 +135,8 @@ def build_count_volume(wb, src, title, dim_label):
             w.copy_row(r)
             fix_first_col(w, [w.row])
             w.set(2, prefix, style_from=1)
+            reg_row = w.row
+            tickers.append(prefix)
             continue
         if src.cell(r, 2).value != dim_label or not isinstance(label, str):
             continue
@@ -132,9 +144,12 @@ def build_count_volume(wb, src, title, dim_label):
             continue
         w.copy_row(r)
         fix_first_col(w, [w.row])
-        w.set(2, prefix + label)
+        # формула Дани: тикер региона из строки региона + название программы
+        w.set(2, f"=$B${reg_row}&A{w.row}")
+        tickers.append(prefix + label)
+        cached[f"B{w.row}"] = prefix + label
     w.finish("D5", "A")
-    return w
+    return tickers, cached
 
 
 def fix_first_col(w, rows):
@@ -211,29 +226,61 @@ def move(ws, row, from_col, to_col):
 
 
 def build_characteristics(wb, src):
-    w = SheetWriter(wb, "Характеристики кредитов", src, shift=1)
-    fix_first_col(w, range(1, HEADER_ROW + 1))
+    # раскладка и формулы как на 01_02_05 у Дани: A — подписи, B — тикер региона, C — ключ, данные с D;
+    # ключ и числа стоят в строке региона и дублируют «Средний срок кредита» по всем программам
+    w = SheetWriter(wb, CHAR_TMP_TITLE, src, shift=2)
+    for rr in range(1, w.row + 1):
+        move(w.ws, rr, 3, 1)
     w.ws.column_dimensions["A"].width = col_widths(src).get(1, 53.7)
-    w.ws.column_dimensions["B"].width = 46.3
+    w.ws.column_dimensions["B"].width = 24.7
+    w.ws.column_dimensions["C"].width = 46.3
     w.ws.cell(HEADER_ROW, 2, "Тикер")._style = copy(w.ws.cell(HEADER_ROW, 1)._style)
+    w.ws.cell(HEADER_ROW, 3, "Ключ")._style = copy(w.ws.cell(HEADER_ROW, 1)._style)
+    # служебная строка 3 с номерами колонок для ВПР (как у Дани): C = 1, D = 2, ...
+    for c in range(3, src.max_column + 3):
+        w.ws.cell(3, c, c - 2)
 
     regions = region_rows(src)
-    prefix = program = None
+    keys = []
+    cached = {}  # результаты формул — чтобы ключи и числа читались и без пересчёта в Excel
+    reg_row = reg_name = None  # строка региона, ещё не получившая ключ
+
+    def check_region():
+        if reg_row is not None:
+            raise SystemExit(
+                f"Характеристики: у региона «{reg_name}» нет строки «{CHAR_KEY_PROGRAM}» / «{CHAR_KEY_ROW}» "
+                f"— в выгрузке изменилась структура, формулы Дани не подойдут")
+
+    program = None
     for r in range(FIRST_DATA_ROW, src.max_row + 1):
         label = src.cell(r, 1).value
         if not isinstance(label, str):
             continue
         w.copy_row(r)
-        fix_first_col(w, [w.row])
+        move(w.ws, w.row, 3, 1)
         if r in regions:
-            prefix = region_ticker(label)
-            w.set(2, prefix, style_from=1)
+            check_region()
+            reg_row, reg_name, program = w.row, label, None
+            w.set(2, region_ticker(label), style_from=1)
         elif not label.startswith(" "):
             program = label
-        else:
-            w.set(2, prefix + program + label)
-    w.finish("C5", "A")
-    return w
+        elif reg_row is not None and program == CHAR_KEY_PROGRAM and label.strip() == CHAR_KEY_ROW:
+            # у Дани: C = B&A(+1)&A(+5), данные = ссылки на строку «Средний срок кредита»
+            rr = w.row
+            w.ws.cell(reg_row, 3, f"=B{reg_row}&A{reg_row + 1}&A{rr}")._style = copy(w.ws.cell(reg_row, 1)._style)
+            key = region_ticker(reg_name) + w.ws.cell(reg_row + 1, 1).value + label
+            keys.append(key)
+            cached[f"C{reg_row}"] = key
+            for c in range(4, w.ncols + w.shift + 1):
+                col = get_column_letter(c)
+                value = w.ws.cell(rr, c).value
+                cell = w.ws.cell(reg_row, c, f"={col}{rr}")
+                cell.number_format = w.ws.cell(rr, c).number_format
+                cached[f"{col}{reg_row}"] = 0 if value is None else value
+            reg_row = None
+    check_region()
+    w.finish("D5", "A")
+    return keys, cached
 
 
 def ticker_values(ws, col):
@@ -285,24 +332,25 @@ def build(raw_path, out_path):
             raise SystemExit(f"В выгрузке нет листа {name} — это точно «Статистические ряды_регионы»?")
     raw_names = list(wb.sheetnames)
     print("Собираю «кол-во»...")
-    build_count_volume(wb, wb["01_02_01"], "кол-во", "Всего, шт.")
+    count_tickers, count_cached = build_count_volume(wb, wb["01_02_01"], "кол-во", "Всего, шт.")
     print("Собираю «объем»...")
-    build_count_volume(wb, wb["01_02_01"], "объем", "Всего, млн руб.")
+    volume_tickers, volume_cached = build_count_volume(wb, wb["01_02_01"], "объем", "Всего, млн руб.")
     print("Собираю «ДДУ»...")
     ddu_keys, ddu_cached = build_ddu(wb, wb["01_02_03"])
-    print("Собираю «Характеристики кредитов»...")
-    build_characteristics(wb, wb["01_02_05"])
+    print(f"Собираю «{CHAR_SHEET}» (характеристики кредитов)...")
+    char_keys, char_cached = build_characteristics(wb, wb["01_02_05"])
     for name in raw_names:
         del wb[name]
+    wb[CHAR_TMP_TITLE].title = CHAR_SHEET
     wb.active = 0
 
     ok = True
     ddu_regions = [v for v in ticker_values(wb["ДДУ"], 4) if v and not str(v).startswith("=")]
-    tickers = {
-        "кол-во": ticker_values(wb["кол-во"], 2),
-        "объем": ticker_values(wb["объем"], 2),
-        "ДДУ": ddu_regions + ddu_keys,  # ключи ДДУ — формулы, проверяем их расчётные значения
-        "Характеристики кредитов": ticker_values(wb["Характеристики кредитов"], 2),
+    tickers = {  # тикеры и ключи — формулы, проверяем их расчётные значения
+        "кол-во": count_tickers,
+        "объем": volume_tickers,
+        "ДДУ": ddu_regions + ddu_keys,
+        CHAR_SHEET: char_keys,
     }
     for name, values in tickers.items():
         n, dups = check_unique(values)
@@ -311,7 +359,10 @@ def build(raw_path, out_path):
             ok = False
             print("    дубли:", sorted(dups)[:10])
     wb.save(out_path)
+    add_cached_values(out_path, "кол-во", count_cached)
+    add_cached_values(out_path, "объем", volume_cached)
     add_cached_values(out_path, "ДДУ", ddu_cached)
+    add_cached_values(out_path, CHAR_SHEET, char_cached)
     print(f"Готово: {out_path}" + ("" if ok else "  (ВНИМАНИЕ: есть дубли тикеров)"))
     return ok
 
